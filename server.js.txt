@@ -1,0 +1,180 @@
+const express = require('express');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const cors = require('cors');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Middleware
+app.use(cors({
+  origin: [
+    'https://thesportsdugout.com',
+    'https://thesportsdugout-contest.pages.dev',
+    'http://localhost:3000',
+    'http://127.0.0.1:5500' // For local development
+  ],
+  credentials: true
+}));
+
+// Raw body for webhooks (must be before express.json())
+app.use('/api/webhook', express.raw({type: 'application/json'}));
+app.use(express.json());
+
+// Health check endpoint
+app.get('/', (req, res) => {
+  res.json({ 
+    status: 'Sports Dugout API is running!',
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'development'
+  });
+});
+
+// Test endpoint to verify environment variables
+app.get('/api/test', (req, res) => {
+  res.json({
+    stripe_configured: !!process.env.STRIPE_SECRET_KEY,
+    webhook_configured: !!process.env.STRIPE_WEBHOOK_SECRET,
+    port: PORT
+  });
+});
+
+// Create payment intent
+app.post('/api/create-payment-intent', async (req, res) => {
+  try {
+    const { amount, currency = 'usd', email } = req.body;
+    
+    // Validate input
+    if (!amount || amount < 1000) {
+      return res.status(400).json({ 
+        error: 'Minimum amount is $10 (1000 cents)' 
+      });
+    }
+
+    if (!process.env.STRIPE_SECRET_KEY) {
+      return res.status(500).json({ 
+        error: 'Stripe not configured' 
+      });
+    }
+
+    console.log('Creating payment intent:', { 
+      amount, 
+      currency, 
+      email: email ? email.substring(0, 3) + '***' : 'none' 
+    });
+
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: parseInt(amount),
+      currency: currency,
+      metadata: {
+        contest: 'sports_dugout_1000',
+        email: email || '',
+        timestamp: new Date().toISOString(),
+        platform: 'thesportsdugout'
+      },
+      receipt_email: email,
+      description: 'Sports Dugout Contest Entry - $1,000 Prize'
+    });
+
+    console.log('Payment intent created:', paymentIntent.id);
+
+    res.json({
+      client_secret: paymentIntent.client_secret,
+      payment_intent_id: paymentIntent.id
+    });
+
+  } catch (error) {
+    console.error('Payment intent error:', error);
+    res.status(500).json({ 
+      error: 'Payment processing failed',
+      message: error.message 
+    });
+  }
+});
+
+// Stripe webhook endpoint
+app.post('/api/webhook', (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body, 
+      sig, 
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+    console.log('✅ Webhook verified:', event.type);
+  } catch (err) {
+    console.error('❌ Webhook signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // Handle different event types
+  switch (event.type) {
+    case 'payment_intent.succeeded':
+      const paymentIntent = event.data.object;
+      console.log('🎉 Payment succeeded:', {
+        id: paymentIntent.id,
+        amount: paymentIntent.amount / 100, // Convert back to dollars
+        email: paymentIntent.metadata.email,
+        contest: paymentIntent.metadata.contest
+      });
+      
+      // TODO: Add user to contest database
+      // TODO: Update leaderboard
+      // TODO: Send confirmation email
+      // await addUserToContest(paymentIntent.metadata.email, paymentIntent.amount);
+      break;
+      
+    case 'payment_intent.payment_failed':
+      console.log('❌ Payment failed:', {
+        id: event.data.object.id,
+        error: event.data.object.last_payment_error?.message
+      });
+      break;
+      
+    case 'payment_intent.created':
+      console.log('💳 Payment intent created:', event.data.object.id);
+      break;
+      
+    default:
+      console.log(`⚠️ Unhandled event type: ${event.type}`);
+  }
+
+  // Return success to acknowledge receipt
+  res.json({ received: true });
+});
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Server error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: process.env.NODE_ENV === 'development' ? error.message : 'Something went wrong'
+  });
+});
+
+// 404 handler
+app.use('*', (req, res) => {
+  res.status(404).json({ 
+    error: 'Endpoint not found',
+    available_endpoints: [
+      'GET /',
+      'GET /api/test',
+      'POST /api/create-payment-intent',
+      'POST /api/webhook'
+    ]
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`🚀 Sports Dugout API running on port ${PORT}`);
+  console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`🔑 Stripe configured: ${!!process.env.STRIPE_SECRET_KEY}`);
+  console.log(`🔗 Webhook configured: ${!!process.env.STRIPE_WEBHOOK_SECRET}`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down gracefully');
+  process.exit(0);
+});
